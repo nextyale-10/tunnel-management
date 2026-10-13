@@ -1,0 +1,31 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime state, logs, and generated test output
+.ssh-tunnels*
+*.gui.json
+*.gui.json.tmp
+logs/
+*.log
+*.log.*
+test-output/
+
+# Local SSH settings and server fingerprints
+/tunnels.ini
+/*known_hosts
+/*known_hosts.*
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+id_rsa
+id_ed25519
