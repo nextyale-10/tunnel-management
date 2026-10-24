@@ -1,0 +1,8 @@
+# Optional local integration server; never bundled with the application.
+paramiko==5.1.0
+bcrypt==5.0.0
+cryptography==50.0.2
+invoke==3.0.3
+pynacl==1.6.2
+cffi==2.1.1
+pycparser==3.12

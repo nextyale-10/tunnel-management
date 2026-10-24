@@ -1,0 +1,105 @@
+name: Windows installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version X.Y.Z (leave empty to read VERSION). Manual runs only upload artifacts.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+      - name: Select version and check release notes
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } elseif ($env:INPUT_VERSION) {
+            $version = $env:INPUT_VERSION -replace '^v', ''
+          } else {
+            $version = (Get-Content VERSION -Raw).Trim()
+          }
+          if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Use a version such as 0.1.0 or a tag such as v0.1.0.'
+          }
+          $notesFile = "release-notes/v$version.md"
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_TYPE -eq 'tag') {
+            if (-not (Test-Path -LiteralPath $notesFile -PathType Leaf)) {
+              throw "Missing release notes: $notesFile. Add the file before publishing this tag."
+            }
+            if ([string]::IsNullOrWhiteSpace((Get-Content -LiteralPath $notesFile -Raw -Encoding utf8))) {
+              throw "Release notes must not be empty: $notesFile."
+            }
+          }
+          "value=$version" >> $env:GITHUB_OUTPUT
+          "notes_file=$notesFile" >> $env:GITHUB_OUTPUT
+      - name: Build installer and test application
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.value }}
+        run: ./build.ps1 -Version $env:BUILD_VERSION -Python (Get-Command python).Source
+      - name: Test installation and uninstallation
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.value }}
+        run: ./packaging/test_installer.ps1 -InstallerPath "dist/ssh-tunnels-${env:BUILD_VERSION}-windows-x64-setup.exe" -Version $env:BUILD_VERSION
+      - name: Test interactive SSH with a local server
+        run: |
+          python -m pip install --disable-pip-version-check --target build/test-dependencies -r requirements-test-ssh.txt
+          python tests/smoke_auth.py --executable dist/ssh-tunnels/ssh-tunnels.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ssh-tunnels-${{ steps.version.outputs.value }}-windows-x64
+          path: dist/*-setup.exe
+          if-no-files-found: error
+      - name: Publish tag release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_NOTES_FILE: ${{ steps.version.outputs.notes_file }}
+        run: |
+          $assets = @(Get-ChildItem dist/*-setup.exe | ForEach-Object FullName)
+          $existingAssets = @(gh release view $env:GITHUB_REF_NAME --json assets --jq '.assets[].name' 2>$null)
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
+            gh release edit $env:GITHUB_REF_NAME --notes-file $env:RELEASE_NOTES_FILE
+            if ($LASTEXITCODE -ne 0) { throw 'Release notes update failed.' }
+            foreach ($asset in $assets) {
+              $checksumAsset = [IO.Path]::GetFileName($asset) + '.sha256'
+              if ($existingAssets -contains $checksumAsset) {
+                gh release delete-asset $env:GITHUB_REF_NAME $checksumAsset --yes
+                if ($LASTEXITCODE -ne 0) { throw "Removing old release asset failed: $checksumAsset" }
+              }
+            }
+          } else {
+            gh release create $env:GITHUB_REF_NAME @assets --verify-tag --title $env:GITHUB_REF_NAME --notes-file $env:RELEASE_NOTES_FILE
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

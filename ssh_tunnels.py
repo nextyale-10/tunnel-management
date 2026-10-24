@@ -49,6 +49,9 @@ class HostEntry:
         self.hostname = ""
         self.user = ""
         self.port = "22"
+        self.heartbeat_interval = 0
+        self.heartbeat_count = 3
+        self.proxyjump = self.proxycommand = "none"
 
     @property
     def has_forward(self):
@@ -155,8 +158,13 @@ def script_dir():
     return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
 
+def runtime_dir():
+    """安装版的设置和状态独立于程序文件，升级/卸载不会删除用户数据。"""
+    return default_log_dir() if getattr(sys, "frozen", False) else script_dir()
+
+
 def default_app_config():
-    return script_dir() / "tunnels.ini"
+    return runtime_dir() / "tunnels.ini"
 
 
 def default_ssh_path():
@@ -203,8 +211,7 @@ def managed_options(cfg):
               f"ServerAliveCountMax={cfg.heartbeat_count}", f"ConnectTimeout={cfg.connect_timeout}",
               "ConnectionAttempts=1", "ControlMaster=no", "ControlPath=none", "ControlPersist=no",
               "ForkAfterAuthentication=no", "PermitLocalCommand=no", "RequestTTY=no", "LogLevel=DEBUG3"]
-    if cfg.batch:
-        values.append("BatchMode=yes")
+    values.append("BatchMode=yes" if cfg.batch else "BatchMode=no")
     return [arg for value in values for arg in ("-o", value)]
 
 
@@ -246,6 +253,10 @@ def read_effective_host(alias, ssh_path, ssh_config, cfg, extra_args=None):
     cmd = [ssh_path, "-G", "-N", "-F", str(Path(ssh_config).expanduser())]
     # 预览不需要 DEBUG3；错误消息只保留 OpenSSH 的配置诊断。
     options = managed_options(cfg)
+    # Read the host's own keepalive values for the GUI; runtime overrides are
+    # applied only when starting a connection with the displayed settings.
+    options = [arg for pair in zip(options[::2], options[1::2])
+               if not pair[1].startswith(("ServerAliveInterval=", "ServerAliveCountMax=")) for arg in pair]
     options[options.index("LogLevel=DEBUG3")] = "LogLevel=ERROR"
     cmd += options + list(extra_args or []) + [alias]
     result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -258,10 +269,14 @@ def read_effective_host(alias, ssh_path, ssh_config, cfg, extra_args=None):
         key, value = _split_directive(line)
         if key in FORWARD_KEYS:
             entry.forwards.append((key, value))
-        elif key in ("hostname", "user", "port"):
+        elif key in ("hostname", "user", "port", "proxyjump", "proxycommand"):
             setattr(entry, key, value)
         elif key == "clearallforwardings":
             clear = value == "yes"
+        elif key == "serveraliveinterval":
+            entry.heartbeat_interval = int(value)
+        elif key == "serveralivecountmax":
+            entry.heartbeat_count = int(value)
     if clear:
         entry.forwards.clear()
     return entry
@@ -322,11 +337,14 @@ class ProcessJob:
 
 class Tunnel(threading.Thread):
     """一个后台线程拥有一个 SSH 进程；快照供 GUI/CLI 定期读取。"""
-    def __init__(self, entry, ssh_path, ssh_config, stop_event, cfg, extra_args=None):
+    def __init__(self, entry, ssh_path, ssh_config, stop_event, cfg, extra_args=None, auth_service=None):
         super().__init__(name=entry.alias, daemon=True)
         self.entry, self.ssh_path, self.ssh_config = entry, ssh_path, ssh_config
         self.stop_event, self.cfg = stop_event, cfg
         self.extra_args = extra_args or []
+        self.auth_service, self.auth_session = auth_service, None
+        self._auth_failed = False
+        self._cancelled = False
         self.log = logging.LoggerAdapter(logging.getLogger(entry.alias),
                                          {"tunnel_key": tunnel_key(entry.alias, ssh_config)})
         self.proc = None
@@ -338,6 +356,7 @@ class Tunnel(threading.Thread):
                            key=tunnel_key(entry.alias, ssh_config),
                            destination=f"{entry.user}@{entry.hostname}:{entry.port}",
                            forwards=list(entry.forwards))
+        self._state["waiting_input"] = False
         self._session_ready = False
         self._remote_confirmed = 0
         self._forward_failed = False
@@ -377,15 +396,22 @@ class Tunnel(threading.Thread):
             if self._session_ready and self._remote_confirmed >= remote_count and not self._forward_failed and not self.stop_event.is_set() and self._state["phase"] == "connecting":
                 self._state.update(phase="connected", message="认证及转发已确认", connected_at=time.time(),
                                    last_received=time.time())
+                self._auth_failed = False
                 self.log.info("已连接：认证及全部转发已确认")
+                if self.auth_session:
+                    self.auth_session.authenticated()
 
         if low.startswith(("debug1:", "debug2:", "debug3:")) or re.match(r"^#\d+\s", line):
             self.log.debug(line)
             return
         if "permission denied" in low or "authentication failed" in low:
-            message = "认证失败，请检查密钥；带口令的密钥请先用 ssh-add 加载到 ssh-agent"
+            message = "认证失败，请检查密码、密钥及服务器允许的登录方式，修正后重新连接"
+            self._auth_failed = True
+            if self.auth_session:
+                self.auth_session.rejected()
         elif "host key verification failed" in low:
-            message = "主机密钥验证失败，请先在终端确认服务器指纹"
+            message = "主机密钥验证失败，请核对服务器指纹和 known_hosts 后重新连接"
+            self._auth_failed = True
         elif "remote port forwarding failed" in low or "address already in use" in low or "could not request local forwarding" in low:
             message = "转发端口被占用或服务器拒绝转发，请检查已有隧道 / VS Code 的转发配置"
         elif "could not resolve hostname" in low:
@@ -414,11 +440,17 @@ class Tunnel(threading.Thread):
             self._session_ready = False
             self._remote_confirmed = 0
             self._forward_failed = False
+            self._auth_failed = False
             self._update(phase="connecting", message="正在认证并建立转发…", connected_at=None,
                          last_received=None, retry_at=None)
             proc = job = pump = None
-            started = time.monotonic()
             try:
+                env = None
+                if self.auth_service:
+                    self.auth_session = self.auth_service.session(self)
+                    env = self.auth_session.environment()
+                # 本地交互组件的首次编译不属于 SSH 连接耗时。
+                started = time.monotonic()
                 # 锁住创建与发布，避免停止恰好发生在 Popen 和 self.proc 赋值之间。
                 with self._lock:
                     if self.stop_event.is_set():
@@ -426,7 +458,7 @@ class Tunnel(threading.Thread):
                     proc = subprocess.Popen(self._build_cmd(), stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                             text=True, encoding="utf-8", errors="replace", bufsize=1,
-                                            creationflags=CREATE_NO_WINDOW)
+                                            creationflags=CREATE_NO_WINDOW, env=env)
                     self.proc = proc
                     self._state["pid"] = proc.pid
                     job = ProcessJob(proc)
@@ -434,18 +466,25 @@ class Tunnel(threading.Thread):
                 pump = threading.Thread(target=self._pump_output, args=(proc,), daemon=True)
                 pump.start()
                 while proc.poll() is None and not self.stop_event.wait(0.2):
-                    if self.snapshot()["connected_at"] is None and time.monotonic() - started > self.cfg.startup_timeout:
+                    state = self.snapshot()
+                    if state["waiting_input"]:
+                        continue
+                    waiting = self.auth_session.waiting_time() if self.auth_session else 0
+                    if state["connected_at"] is None and time.monotonic() - started - waiting > self.cfg.startup_timeout:
                         self._update(message="认证或转发确认超时，请检查密钥、网络及服务器转发权限")
                         self.terminate()
                         break
                 if self.stop_event.is_set():
                     self.terminate()
                 rc = proc.wait()
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
                 self._update(phase="error", message=f"无法启动 SSH：{exc}")
                 self.log.error("无法启动 SSH：%s", exc)
                 return
             finally:
+                if self.auth_session:
+                    self._cancelled = self.auth_session.cancelled
+                    self.auth_session.close()
                 if proc and proc.poll() is None:
                     self.terminate()
                 if job:
@@ -463,7 +502,7 @@ class Tunnel(threading.Thread):
             previous = self.snapshot()["message"]
             if previous in ("认证及转发已确认", "正在认证并建立转发…"):
                 previous = "SSH 进程已退出"
-            if not self.cfg.auto_reconnect:
+            if not self.cfg.auto_reconnect or self._auth_failed:
                 self._update(phase="error", message=f"连接已断开 (退出码 {rc})；{previous}")
                 return
             if uptime >= self.cfg.stable_seconds:
@@ -474,7 +513,8 @@ class Tunnel(threading.Thread):
             if self.stop_event.wait(backoff):
                 break
             backoff = min(backoff * 2, self.cfg.backoff_max)
-        self._update(phase="disconnected", message="已断开", pid=None, retry_at=None)
+        self._update(phase="disconnected", message="已取消认证，自动重连已停止" if self._cancelled else "已断开",
+                     pid=None, retry_at=None, waiting_input=False)
 
     def terminate(self):
         with self._lock:
@@ -514,8 +554,9 @@ def disconnected_snapshot(alias="", ssh_config=None):
 
 class TunnelController:
     """每个配置文件/Host 独立管理。操作在后台串行执行，读取状态不等待停止。"""
-    def __init__(self, ssh_path, cfg, extra_args=None):
+    def __init__(self, ssh_path, cfg, extra_args=None, auth_service=None):
         self.ssh_path, self.cfg, self.extra_args = ssh_path, cfg, extra_args
+        self.auth_service = auth_service
         self.tunnels = {}
         self._lock = threading.Lock()
         self._operation_lock = threading.Lock()
@@ -533,7 +574,7 @@ class TunnelController:
                 old.stop()
             # 独立复制设置，修改另一 Host 的保活/自动重连不影响已运行的连接。
             tunnel = Tunnel(copy.deepcopy(entry), self.ssh_path, Path(ssh_config).expanduser().resolve(),
-                            threading.Event(), copy.copy(cfg or self.cfg), self.extra_args)
+                            threading.Event(), copy.copy(cfg or self.cfg), self.extra_args, self.auth_service)
             tunnel._update(phase="connecting", message="正在启动此 Host 的连接…")
             with self._lock:
                 self.tunnels[key] = tunnel
@@ -586,12 +627,13 @@ class TunnelController:
 
 
 class InstanceLock:
-    """项目目录中的 OS 文件锁，GUI、CLI 和所有启动器共用。"""
+    """运行数据目录中的 OS 文件锁，GUI、CLI 和所有启动器共用。"""
     def __init__(self, directory=None):
-        self.directory = Path(directory or script_dir())
+        self.directory = Path(directory) if directory is not None else runtime_dir()
         self.file = None
 
     def acquire(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
         file = (self.directory / ".ssh-tunnels.lock").open("a+b")
         file.seek(0, 2)
         if file.tell() == 0:
@@ -648,12 +690,12 @@ def request_running(action):
         return 0
     if action == "status":
         try:
-            state = json.loads((script_dir() / ".ssh-tunnels-state.json").read_text(encoding="utf-8"))
+            state = json.loads((lock.directory / ".ssh-tunnels-state.json").read_text(encoding="utf-8"))
             print(json.dumps(state, ensure_ascii=False, indent=2))
         except (OSError, ValueError):
             print("管理器正在运行，状态尚未写入")
     else:
-        (script_dir() / ".ssh-tunnels.stop").touch()
+        (lock.directory / ".ssh-tunnels.stop").touch()
         print("已请求关闭管理器并断开隧道")
     return 0
 
@@ -712,6 +754,7 @@ def main():
         if config_path.exists():
             print(f"已存在，不覆盖：{config_path}")
             return 1
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
         return 0
     cfg = load_app_config(config_path)
@@ -726,15 +769,15 @@ def main():
         return 0
     lock = InstanceLock()
     if not lock.acquire():
-        (script_dir() / ".ssh-tunnels.show").touch()
+        (lock.directory / ".ssh-tunnels.show").touch()
         print("管理器已经运行，已请求显示窗口")
         return 0
     try:
         log_file = setup_logging(args.log_dir or cfg.log_dir or default_log_dir(), args.verbose)
         if args.cli or (not args.gui and (args.only is not None or args.auto)):
             return run_cli(args, cfg, ssh_path, ssh_config, lock)
-        # GUI 不接受终端密码输入；不会因旧 batch=no 而卡在不可见提示。
-        cfg.batch = True
+        # GUI 使用 AskPass 弹窗处理密码、私钥口令和服务器指纹。
+        cfg.batch = False
         from ssh_tunnels_gui import run_gui
         return run_gui(cfg, ssh_path, ssh_config, config_path, log_file, lock,
                        args.ssh_arg, config_override=args.ssh_config is not None, startup_hosts=args.only)

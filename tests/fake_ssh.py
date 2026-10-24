@@ -1,6 +1,8 @@
 """只模拟本地进程及 OpenSSH 日志，不访问网络。"""
 import sys
 import time
+import os
+import subprocess
 
 mode = sys.argv[1]
 
@@ -13,6 +15,11 @@ if mode == "authfail":
 if mode == "hang":
     time.sleep(30)
     sys.exit(0)
+if mode == "prompt":
+    response = subprocess.run([os.environ["SSH_ASKPASS"], "demo@localhost's password: "],
+                              capture_output=True)
+    if response.returncode:
+        sys.exit(255)
 emit("debug3: receive packet: type 52")
 emit('Authenticated to fake ([127.0.0.1]:22) using "publickey".')
 emit("debug1: Entering interactive session.")

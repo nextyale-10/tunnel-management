@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 venv/
 
+# Installer build output and downloaded build tools
+build/
+dist/
+*.spec
+
 # Runtime state, logs, and generated test output
 .ssh-tunnels*
 *.gui.json

@@ -1,90 +1,85 @@
 # SSH 隧道管理器
 
-双击 **start.bat**（或无控制台的 **start-silent.vbs**）打开图形界面。需要已安装带 tkinter 的 Python 和 OpenSSH，无需安装第三方 Python 包。
+**独立管理常驻 SSH 隧道，不必专门留着一个 VS Code 窗口。**
 
-## 使用
+这是一个 Windows 桌面应用，用于建立和维护需要长期运行的 SSH 端口转发。隧道由应用保持连接、监控状态并在断线后自动重连，VS Code 和终端会话可以独立打开、关闭或切换工作目录。
 
-1. 默认读取 `~/.ssh/config`；可以点击“选择文件”改用其他 SSH 配置。
-2. 从列表选择一个 Host，查看目标及实际生效的转发规则。可以搜索 Host 名称。
-3. 点击“建立隧道”或双击 Host。没有转发规则、配置读取失败的 Host 无法启动隧道。
-4. 选择其他 Host 后点击“建立隧道”，可以同时连接多个 Host，已有连接继续运行。同一 SSH 配置中的同一 Host 不会重复建立连接；点击“重新连接此 Host”仅重建这一条。
-5. 主页面的连接状态、服务器响应时间和日志只显示左侧选中的 Host。选中尚未连接的 Host 时显示“未连接”，不会显示另一条隧道的状态。
-6. 点击右上角“全部隧道”打开独立的全局状态窗口，查看所有已建立过的隧道、服务器、状态、最近响应、连接时长和重连次数。可以断开选中隧道或全部断开；关闭这个状态窗口不影响连接。
-7. 主页面点击“断开此 Host”只停止选中 Host 的连接及自动重连。最小化主窗口可继续运行；关闭主窗口会断开全部隧道并退出。
+## 适用场景
 
-GUI 不会打开后自动连接；上次选择的 Host、SSH 配置路径、保活设置会保存在项目目录的 `tunnels.gui.json`。日常使用无需 `tunnels.ini`，程序直接使用内置默认值和界面偏好。命令行连接时用 `--only HOST` 指定主机。
+你在 SSH 登录配置中设置了固定端口转发，希望多个 VS Code 窗口都能使用它，但又不希望每个窗口都重复申请同一个转发端口。过去需要留一个窗口专门维持隧道；这个应用接替那个窗口，集中维护隧道，其他窗口使用不带这组转发的配置登录。
 
-`tunnels.ini` 仅作为可选的高级配置入口保留，供指定 SSH 可执行文件、日志目录或重连退避参数等用途；需要时可运行 `python ssh_tunnels.py --init` 生成。项目默认不附带这个文件。
+## 功能
 
-## 连接状态与保活
-
-| 状态 | 含义 |
+| 功能 | 说明 |
 | --- | --- |
-| 连接中 | SSH 正在连接、认证或等待远程转发确认 |
-| 已连接 | 已进入 SSH 会话且全部 RemoteForward 获得成功确认 |
-| 等待服务器响应 | 最近超过两个保活间隔没有收到 SSH 数据包，等待 OpenSSH 判定 |
-| 等待重连 | SSH 退出，等待退避计时后重新连接 |
-| 连接失败 | 启动失败，或关闭自动重连后连接退出 |
-| 未连接 | 尚未连接或用户主动断开 |
+| 常驻隧道 | 关闭窗口后驻留系统托盘，隧道继续运行，不占用任务栏 |
+| 多连接管理 | 同时维护多个 Host，每条连接可以独立重连和断开 |
+| 端口转发 | 支持远程转发、本地转发和 SOCKS 动态代理，一个 Host 可添加多条规则 |
+| 配置读取与新增 | 读取现有 SSH 配置，也可在界面中新增连接和转发规则，保存后自动刷新 |
+| 登录验证 | 支持密码、密钥、服务器指纹确认、私钥口令及键盘交互验证 |
+| 记住密码 | 可选择保存登录密码，供下次启动和自动重连使用，也可随时清除 |
+| 保活与自动重连 | 每条隧道独立设置保活间隔、未响应次数和是否自动重连 |
+| 状态与日志 | 查看选中 Host 的连接状态和日志，通过“全部隧道”集中查看、断开连接 |
 
-默认保活间隔 15 秒、未响应次数 3，空闲连接约 45 秒无响应会断开；实际时间受网络、系统调度影响。OpenSSH 在**原来的 SSH 加密通道**内发送保活。界面定期读取进程与服务器数据包状态，并显示最近一次服务器响应时间。正常 SSH 数据流也算服务器响应；该时间不是独立 ping 的时间。连接恢复后自动更新状态。
+## 安装
 
-每条隧道独立保活和自动重连，某条断线不影响其他 Host。自动重连从 3 秒开始，逐步增加至 60 秒；稳定连接后重置。保活间隔、未响应次数和自动重连按 Host 保存，界面设置在该 Host 下一次连接时生效，不影响其他正在运行的连接。连接建立过程另有 60 秒确认超时，避免长时间卡住。
+从 [GitHub Releases](https://github.com/nextyale-10/tunnel-management/releases) 下载 `ssh-tunnels-<版本>-windows-x64-setup.exe`，安装后从开始菜单打开 **SSH Tunnels**。
 
-“已连接”表示 SSH 和转发监听已建立，不代表转发终点服务一定可用。例如本地代理端口 7897 上没有服务，SSH 仍可能显示已连接。这一边界见 [OpenSSH 的 ExitOnForwardFailure 说明](https://man.openbsd.org/ssh_config#ExitOnForwardFailure)。
+运行环境为 Windows 10/11 x64，需要 Windows OpenSSH 客户端（支持 AskPass，8.6 或更新版本）和 .NET Framework 4。OpenSSH 客户端可在 Windows“可选功能”中安装。安装包内置 Python 和 tkinter，无需另外安装 Python。
 
-## 与 VS Code 配合
+## 开始使用
 
-程序为每个选中的 Host 管理一条**专用 SSH 转发连接**，支持多个 Host 同时连接；一个 Host 可以在自己的连接里配置多个端口转发。VS Code Remote SSH 仍需自己的登录连接。为了避免 VS Code 重复请求相同的 RemoteForward，分别使用“带转发的 Host”和“不含转发的登录 Host”。
+1. 打开应用，默认读取 `~/.ssh/config`；如需使用其他配置，点击“选择文件”。
+2. 从左侧列表选择需要常驻的 Host，检查右侧“生效的转发规则”。如果还没有配置，可点击“新增连接”。
+3. 点击“建立隧道”，按提示完成指纹确认或登录验证，等待状态变为“已连接”。
+4. 关闭窗口，让应用驻留右下角系统托盘、继续维护隧道。需要管理多条连接时，双击托盘图标恢复窗口，在“全部隧道”中查看和管理。
 
-同一台服务器的两个别名如果申请相同的远端监听地址和端口，仍会发生端口冲突；多个 LocalForward / DynamicForward 也不能占用相同的本机监听端口。转发失败会显示错误，其他已连接的隧道继续运行。
+默认打开应用后需要手动连接。“断开此 Host”只停止选中 Host 的连接和自动重连。**点击主窗口右上角的关闭按钮会隐藏到系统托盘，不占用任务栏；双击托盘图标可恢复窗口，右键菜单可选择“显示窗口”或“退出应用”。** 退出应用会断开全部隧道。托盘图标也可能位于右下角的隐藏图标区域。
 
-```sshconfig
-Host server-tunnel
-    HostName example.com
-    User your-user
-    IdentityFile ~/.ssh/id_ed25519
-    RemoteForward 127.0.0.1:9688 127.0.0.1:7897
+## 新增一条常驻隧道
 
-Host server-code
-    HostName example.com
-    User your-user
-    IdentityFile ~/.ssh/id_ed25519
-```
+没有现成的转发配置时，可以直接在应用中创建。例如，让远端服务器通过 `3333` 端口访问本机 `7897` 端口：
 
-管理器选择 `server-tunnel`，VS Code 连接 `server-code`。若在 `Host *` 或其他匹配块中配置了 RemoteForward，登录 Host 也可能继承它，请调整其匹配范围。不要给 VS Code Host 设置 `ClearAllForwardings yes`：这也会清除它为编辑器申请的 LocalForward / DynamicForward。该选项的作用见 [OpenSSH 配置文档](https://man.openbsd.org/ssh_config#ClearAllForwardings)。
+1. 点击“新增连接”，填写 Host 别名、服务器地址、SSH 端口和用户名，选择“自动”“密码登录”或“密钥登录”。
+2. 在端口转发区域选择“远程转发 (RemoteForward)”，填写：
 
-本程序不改写 SSH Host 配置。Host 列表枚举显式别名及 Include 文件，忽略通配符和取反模式；有效配置由 `ssh -G -N` 解析，支持继承、Match、Include。读取失败会显示错误，不会把失败配置当成有效连接。
+   | 字段 | 示例值 |
+   | --- | --- |
+   | 监听地址 | `127.0.0.1` |
+   | 监听端口 | `3333` |
+   | 目标地址 | `127.0.0.1` |
+   | 目标端口 | `7897` |
 
-## 认证与日志
+3. 点击“添加转发规则”。需要多条转发时继续添加，再点击“保存并刷新”。
+4. 在主界面选中新 Host，点击“建立隧道”。连接建立后，远端程序可通过 `127.0.0.1:3333` 访问本机的 `127.0.0.1:7897`，本机目标服务需要正常运行。
 
-GUI 强制使用非交互认证，适合 SSH 密钥或 ssh-agent。带口令的密钥先在终端使用 `ssh-add` 加载到代理。首次连接未知主机时，请先在终端确认服务器指纹。GUI 不保存密码，也不跳过主机密钥校验。旧配置的 `batch = no` 在 GUI 中不会启用不可见的密码提示。
+保存时会先校验 SSH 配置并备份原文件，再写入新 Host、刷新列表；已有隧道继续运行。新增 Host 默认包含 `ExitOnForwardFailure yes` 和 `ServerAliveInterval 30`，备份文件位于原配置旁，名称为 `config.<时间戳>.bak`。
 
-界面显示操作和错误日志，详细日志默认在 `%LOCALAPPDATA%\ssh-tunnels\ssh-tunnels.log`，点击“打开日志”即可查看。日志自动轮转；`--verbose` 可记录 OpenSSH 调试输出。
+当前界面支持新增 Host。已有配置的编辑或删除需要修改 SSH 配置文件，再点击“刷新 Host”或按 `Ctrl+R`。
 
-## 启动和命令行
+## 连接与密码
 
-| 入口 | 操作 |
+在主界面可以为选中 Host 调整保活间隔、未响应次数及“断线自动重连”，这些设置在下一次连接时生效。新建 Host 的保活间隔为 30 秒；普通断线会按设置自动重连，最终认证失败或取消验证后停止自动重试，可在处理问题后手动连接。
+
+“已连接”表示 SSH 和转发监听已建立，目标端口上的服务还需要正常运行。需要排查时，查看当前 Host 的日志或点击“打开日志”。
+
+| 验证信息 | 保存方式 |
 | --- | --- |
-| `start.bat` / `start-silent.vbs` | 打开 GUI；重复打开会唤起已运行窗口 |
-| `stop.bat` | 请求管理器正常断开全部隧道并退出，仅操作本项目实例 |
-| `status.bat` | 查看本项目管理器及全部受管理的隧道状态 |
-| `tunnels.bat --only HOST1 HOST2` | 在控制台维护一个或多个指定 Host |
+| 普通登录密码，勾选“记住密码” | 认证及转发成功后保存到当前 Windows 用户的凭据管理器，下次启动和自动重连可复用 |
+| 普通登录密码，未勾选 | 仅在本次运行中缓存，退出后清除 |
+| 私钥口令、验证码、服务器的键盘交互提示 | 仅用于本次验证 |
+| 配置了 `ProxyJump` / `ProxyCommand` 的连接 | 支持交互，暂不保存或自动填充密码 |
+
+密码不写入 SSH 配置、界面偏好、命令行或日志。点击“忘记密码”可清除当前 Host 的已保存密码和运行内缓存。服务器指纹由 OpenSSH 按现有配置校验，应用在需要时弹窗确认。
+
+安装版的设置、运行状态和日志保存在 `%LOCALAPPDATA%\ssh-tunnels\`；源码版的设置和运行状态保存在项目目录。升级或卸载会保留用户数据、SSH 配置和已保存密码，需要清除密码时可先使用“忘记密码”。
+
+## 从源码运行
+
+需要 Python（包含 tkinter，建议 Python 3.12）、Windows OpenSSH 和 .NET Framework 4；无需安装第三方 Python 包。
 
 ```powershell
 python ssh_tunnels.py --gui
-python ssh_tunnels.py --gui --only server-tunnel
-python ssh_tunnels.py --gui --only host-a host-b
-python ssh_tunnels.py --list
-python ssh_tunnels.py --cli --only server-tunnel
-python ssh_tunnels.py --cli --only host-a host-b
-python ssh_tunnels.py --stop
-python ssh_tunnels.py --status
-python -m unittest discover -s tests -v
 ```
 
-GUI、CLI 和启动器共用项目目录的 OS 文件锁，管理器不会重复启动。CLI 支持 `--only HOST1 HOST2` 同时维护多个 Host；`--auto` 会连接所有带有效转发的 Host，请确认这些转发没有端口冲突。不要复制项目到多个目录同时运行。Windows 使用 Job 对象，在管理器被强制结束时清理所属 SSH 子进程；不会扫描并终止其他软件的 SSH 会话。
-
-`tunnels.gui.json` 保存实际使用的界面偏好；隐藏的 `.ssh-tunnels.lock` 和 `.ssh-tunnels-state.json` 用于单实例控制和运行状态，应保留。`__pycache__` 和 `test-output` 是可重新生成的缓存、测试产物，清理后不影响使用。
-
-默认 GUI 启动后等待手动选择；显式传入 `--gui --only HOST1 HOST2` 时，在配置加载完成后连接指定 Host，可用于接替原来的后台隧道。全局状态文件包含 `tunnels` 列表和按状态统计的 `counts`，不受主页面当前选择影响。
+Python 的 `pythonw.exe` 在 PATH 中时，也可以双击 `start.bat` 或 `start-silent.vbs`。
