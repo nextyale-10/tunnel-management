@@ -21,10 +21,10 @@ project = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project))
 sys.path.insert(0, str(project / "build/test-dependencies"))
 import paramiko
-import ssh_tunnels as core
-import ssh_tunnels_gui as gui
-from ssh_auth import AuthService
-from ssh_credentials import CredentialStore, credential_prefix
+from tunnel_manager import runtime, connections
+from tunnel_manager.config import ssh, defaults
+from tunnel_manager.ui import app as gui
+from tunnel_manager.auth.credentials import CredentialStore, credential_prefix
 
 PASSWORD = "local-test-only-密碼"
 
@@ -116,11 +116,11 @@ def main():
     ServerAliveInterval 30
     RemoteForward 127.0.0.1:18080 127.0.0.1:8080
 ''', encoding="utf-8")
-        cfg = core.AppConfig()
+        cfg = defaults.AppConfig()
         cfg.startup_timeout = 30
-        entry = core.read_effective_host("auth-test", core.default_ssh_path(), config, cfg)
+        entry = ssh.read_effective_host("auth-test", runtime.default_ssh_path(), config, cfg)
         store = CredentialStore()
-        lock = core.InstanceLock(directory)
+        lock = runtime.InstanceLock(directory)
         assert lock.acquire()
 
         def spin(predicate, timeout=15):
@@ -135,7 +135,7 @@ def main():
         def start_gui():
             nonlocal root, app
             root = tk.Tk()
-            app = gui.TunnelApp(root, cfg, core.default_ssh_path(), config,
+            app = gui.TunnelApp(root, cfg, runtime.default_ssh_path(), config,
                                 directory / "settings.ini", directory / "test.log", lock, config_override=True)
             spin(lambda: not app.loading)
             assert app.interval_var.get() == "30"
@@ -156,7 +156,7 @@ def main():
             assert app.auth_window.request.kind == "confirm"
             assert "SHA256:" in app.auth_window.request.prompt
             # Waiting longer than startup_timeout must not kill the connection.
-            active = app.controller.tunnels[core.tunnel_key("auth-test", config)]
+            active = app.controller.tunnels[connections.tunnel_key("auth-test", config)]
             active.cfg.startup_timeout = 1
             until = time.monotonic() + 1.3
             spin(lambda: time.monotonic() > until)
@@ -222,7 +222,7 @@ def main():
             private = directory / "test_key"
             server.publickey = paramiko.RSAKey.generate(2048)
             server.publickey.write_private_key_file(str(private), password="key-test-only")
-            from ssh_config_editor import _secure_windows_temp
+            from tunnel_manager.config.editor import _secure_windows_temp
             _secure_windows_temp(private)
             key_config = directory / "key_config"
             key_config.write_text(config.read_text(encoding="utf-8").replace("Host auth-test", "Host key-test")
@@ -230,7 +230,7 @@ def main():
                                   .replace("PubkeyAuthentication no", "PubkeyAuthentication yes") +
                                   f'    IdentityFile "{private.as_posix()}"\n    IdentitiesOnly yes\n    BatchMode yes\n', encoding="utf-8")
             root = tk.Tk()
-            app = gui.TunnelApp(root, cfg, core.default_ssh_path(), key_config,
+            app = gui.TunnelApp(root, cfg, runtime.default_ssh_path(), key_config,
                                 directory / "key-settings.ini", directory / "test.log", lock, config_override=True)
             spin(lambda: not app.loading)
             app.connect()

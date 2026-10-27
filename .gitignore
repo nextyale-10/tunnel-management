@@ -13,6 +13,8 @@ dist/
 .ssh-tunnels*
 *.gui.json
 *.gui.json.tmp
+*.settings.json
+*.settings.json.tmp
 logs/
 *.log
 *.log.*
@@ -34,3 +36,5 @@ test-output/
 *.pfx
 id_rsa
 id_ed25519
+
+AGENTS.md

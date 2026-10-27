@@ -172,7 +172,7 @@ VSVersionInfo(
     # .NET Framework's windowless helper forwards OpenSSH prompts to the GUI.
     $askpassCompiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     Invoke-Checked $askpassCompiler @('/nologo', '/target:winexe', '/optimize+',
-        ('/out:{0}' -f (Join-Path $appDirectory 'ssh-askpass.exe')), (Join-Path $PSScriptRoot 'packaging\askpass.cs'))
+        ('/out:{0}' -f (Join-Path $appDirectory 'ssh-askpass.exe')), (Join-Path $PSScriptRoot 'tunnel_manager\auth\askpass.cs'))
     $pythonLicense = & $basePython -c "from pathlib import Path; import sys; print(Path(sys.base_prefix) / 'LICENSE.txt')"
     if ($LASTEXITCODE -ne 0) { throw 'Could not locate the bundled Python license.' }
     if (Test-Path -LiteralPath $pythonLicense -PathType Leaf) {

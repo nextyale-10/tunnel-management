@@ -114,11 +114,23 @@ def main():
             assert not list(executable.parent.glob(".ssh-tunnels*")), "State leaked into install directory"
             assert not list(executable.parent.glob("*.gui.json")), "Preferences leaked into install directory"
             assert config.read_text(encoding="utf-8").startswith("Host package-test\n")
+            if os.name == "nt":
+                # 配置中心保存的关闭行为在打包程序重启后同样生效。
+                settings = data / "tunnels.settings.json"
+                settings.write_text(json.dumps({"close_action": "exit", "backup_limit": 2}), encoding="utf-8")
+                state_path.unlink()
+                process = subprocess.Popen([str(executable), "--gui", "--ssh-config", str(config)], env=env)
+                wait_for(lambda: state_path.is_file(), process)
+                assert json.loads(state_path.read_text(encoding="utf-8"))["manager_pid"] == process.pid
+                api, hwnd = find_window(process.pid, "SSH 隧道管理器")
+                assert api.PostMessageW(hwnd, 0x0010, 0, 0)
+                assert process.wait(timeout=20) == 0, "Configured close action did not exit"
+                assert not list(executable.parent.glob("*.settings.json")), "Global settings leaked into install directory"
         finally:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=10)
-    print("PACKAGE PASS: frozen GUI, user data, SSH config loading, tray hide/double-click, singleton restore, tray menu exit/cleanup")
+    print("PACKAGE PASS: frozen GUI, user data, SSH config loading, tray hide/double-click, singleton restore, tray menu exit/cleanup, persisted close action")
 
 
 if __name__ == "__main__":

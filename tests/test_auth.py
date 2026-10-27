@@ -9,9 +9,10 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-import ssh_auth as auth
-import ssh_tunnels as core
-from ssh_credentials import CredentialStore, credential_prefix
+from tunnel_manager.auth import service as auth
+from tunnel_manager import runtime, connections
+from tunnel_manager.config import defaults
+from tunnel_manager.auth.credentials import CredentialStore, credential_prefix
 from test_tunnels import entry, wait_for
 
 
@@ -35,6 +36,11 @@ class MemoryStore:
             if key.startswith(prefix):
                 del self.values[key]
 
+    def copy_prefix(self, source, destination):
+        for key, value in list(self.values.items()):
+            if key.startswith(source):
+                self.values[destination + key[len(source):]] = value
+
 
 class AuthTests(unittest.TestCase):
     def setUp(self):
@@ -42,9 +48,24 @@ class AuthTests(unittest.TestCase):
         self.warnings = []
         self.store = MemoryStore()
         self.service = auth.AuthService(self.requests.put, self.warnings.append, self.store)
-        self.tunnel = core.Tunnel(entry(), sys.executable, "config", threading.Event(), core.AppConfig())
+        self.tunnel = connections.Tunnel(entry(), sys.executable, "config", threading.Event(), defaults.AppConfig())
         self.session = self.service.session(self.tunnel)
         self.addCleanup(self.session.close)
+
+    def test_rename_copies_password_only_when_login_destination_is_unchanged(self):
+        old, renamed = entry("old"), entry("renamed")
+        old.hostname = renamed.hostname = "same.example.com"
+        source, target = credential_prefix(old, "config"), credential_prefix(renamed, "config")
+        self.store.write(source + "prompt", "saved-password")
+        self.service.memory[source + "prompt"] = "memory-password"
+        self.service.copy_renamed_credentials(old, renamed, "config")
+        self.assertEqual(self.store.read(target + "prompt"), "saved-password")
+        self.assertEqual(self.service.memory[target + "prompt"], "memory-password")
+        renamed.hostname = "different.example.com"
+        other = credential_prefix(renamed, "config")
+        self.service.copy_renamed_credentials(old, renamed, "config")
+        self.assertIsNone(self.store.read(other + "prompt"))
+        self.assertNotIn(other + "prompt", self.service.memory)
 
     def test_prompt_types_do_not_cache_otp_or_key_passphrase(self):
         self.assertEqual(auth.prompt_kind("demo@localhost's password: "), "password")
@@ -59,7 +80,7 @@ class AuthTests(unittest.TestCase):
         secret = "中文 & \" % ! ' password"
         prompt = "demo@localhost's password: "
         process = subprocess.Popen([env["SSH_ASKPASS"], prompt], env=env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, creationflags=core.CREATE_NO_WINDOW)
+                                   stderr=subprocess.PIPE, creationflags=runtime.CREATE_NO_WINDOW)
         self.addCleanup(lambda: process.poll() is None and process.kill())
         request = self.requests.get(timeout=5)
         request.reply(secret, remember=True)
@@ -97,10 +118,10 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(self.store.read(key), "correct")
 
     def test_cancellation_stops_reconnect_and_waiting_does_not_timeout(self):
-        cfg = core.AppConfig()
+        cfg = defaults.AppConfig()
         cfg.batch = False
         cfg.startup_timeout = 30
-        tunnel = core.Tunnel(entry(), sys.executable, "config", threading.Event(), cfg, auth_service=self.service)
+        tunnel = connections.Tunnel(entry(), sys.executable, "config", threading.Event(), cfg, auth_service=self.service)
         tunnel._build_cmd = lambda: [sys.executable, str(Path(__file__).with_name("fake_ssh.py")), "prompt"]
         tunnel.start()
         self.addCleanup(tunnel.stop)
@@ -117,11 +138,11 @@ class AuthTests(unittest.TestCase):
         self.assertIn("已取消认证", tunnel.snapshot()["message"])
 
     def test_local_auth_preparation_does_not_consume_ssh_timeout(self):
-        cfg = core.AppConfig()
+        cfg = defaults.AppConfig()
         cfg.startup_timeout = 1
         cfg.auto_reconnect = False
         prepared_at = []
-        tunnel = core.Tunnel(entry(), sys.executable, "config", threading.Event(), cfg, auth_service=self.service)
+        tunnel = connections.Tunnel(entry(), sys.executable, "config", threading.Event(), cfg, auth_service=self.service)
         tunnel._build_cmd = lambda: [sys.executable, str(Path(__file__).with_name("fake_ssh.py")), "hang"]
         original_environment = auth.AuthSession.environment
 
@@ -173,6 +194,10 @@ class AuthTests(unittest.TestCase):
         store.write(prefix + "one", "测试-password")
         store.write(prefix + "two", "another")
         self.assertEqual(CredentialStore().read(prefix + "one"), "测试-password")
+        renamed_prefix = prefix + "renamed/"
+        store.copy_prefix(prefix, renamed_prefix)
+        self.assertEqual(CredentialStore().read(renamed_prefix + "one"), "测试-password")
+        self.assertEqual(CredentialStore().read(renamed_prefix + "two"), "another")
         store.delete_prefix(prefix)
         self.assertIsNone(store.read(prefix + "one"))
         self.assertIsNone(store.read(prefix + "two"))

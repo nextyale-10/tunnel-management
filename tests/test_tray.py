@@ -6,7 +6,7 @@ import unittest
 from ctypes import wintypes
 from pathlib import Path
 
-from ssh_tray import WindowsTrayIcon
+from tunnel_manager.ui.tray import WindowsTrayIcon
 
 
 @unittest.skipUnless(os.name == "nt", "Windows system tray")

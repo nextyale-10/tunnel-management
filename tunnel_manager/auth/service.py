@@ -12,7 +12,8 @@ import threading
 import time
 from pathlib import Path
 
-from ssh_credentials import CredentialStore, credential_prefix
+from tunnel_manager.runtime import script_dir
+from tunnel_manager.auth.credentials import CredentialStore, credential_prefix
 
 _helper_lock = threading.Lock()
 
@@ -23,9 +24,9 @@ def helper_path():
         if not path.is_file():
             raise OSError("缺少 ssh-askpass.exe，请重新安装完整程序")
         return path
-    source = Path(__file__).parent / "packaging" / "askpass.cs"
+    source = Path(__file__).with_name("askpass.cs")
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
-    path = source.parent.parent / "build" / f"ssh-askpass-{digest}.exe"
+    path = script_dir() / "build" / f"ssh-askpass-{digest}.exe"
     with _helper_lock:
         if not path.is_file():
             compiler = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -90,6 +91,21 @@ class AuthService:
             for session in self.sessions:
                 if session.prefix == prefix:
                     session.pending.clear()
+
+    def copy_renamed_credentials(self, old, new, config):
+        # 地址、用户或跳板配置改变时不转移密码，避免把旧服务器的密码用于新目标。
+        fields = ("hostname", "port", "user", "proxyjump", "proxycommand")
+        if old.alias == new.alias or any(getattr(old, key) != getattr(new, key) for key in fields):
+            return
+        source, destination = credential_prefix(old, config), credential_prefix(new, config)
+        with self.lock:
+            for key, value in list(self.memory.items()):
+                if key.startswith(source):
+                    self.memory[destination + key[len(source):]] = value
+            try:
+                self.store.copy_prefix(source, destination)
+            except (OSError, ValueError):
+                self.warning_callback("Host 已改名，但保存的密码未能复制；下次连接可能需要重新输入。")
 
 
 class AuthSession:

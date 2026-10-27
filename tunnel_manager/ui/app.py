@@ -1,4 +1,4 @@
-"""仅使用 Python 标准库的 Tk 图形界面。所有 SSH/停止工作都在后台线程。"""
+"""主窗口与界面事件协调；各功能窗口在同目录独立维护。"""
 
 import copy
 from collections import deque
@@ -12,18 +12,18 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-
-from ssh_tunnels import TunnelController, parse_ssh_config, read_effective_host, write_json, tunnel_key
-from ssh_config_editor import build_host_block, format_forward, save_new_host
-from ssh_auth import AuthService
-from ssh_tray import WindowsTrayIcon
-
-PHASES = {
-    "disconnected": ("未连接", "#64748b"), "connecting": ("连接中", "#b45309"),
-    "connected": ("已连接", "#15803d"), "unresponsive": ("等待服务器响应", "#b45309"),
-    "reconnecting": ("等待重连", "#b45309"), "stopping": ("正在断开", "#b45309"),
-    "error": ("连接失败", "#b91c1c"),
-}
+from tunnel_manager.connections import TunnelController, tunnel_key
+from tunnel_manager.config.ssh import parse_ssh_config, read_effective_host
+from tunnel_manager.config.editor import load_host_config, delete_host
+from tunnel_manager.runtime import write_json, resource_path
+from tunnel_manager.auth.service import AuthService
+from tunnel_manager.ui.tray import WindowsTrayIcon
+from tunnel_manager.ui.common import PHASES
+from tunnel_manager.ui.host_dialogs import NewHostWindow, HostEditorWindow, ConfigSourceWindow
+from tunnel_manager.ui.auth_dialog import AuthWindow
+from tunnel_manager.ui.tunnels_window import GlobalTunnelWindow
+from tunnel_manager.config.settings import SettingsStore
+from tunnel_manager.ui.settings_dialog import SettingsWindow
 
 
 class QueueLogHandler(logging.Handler):
@@ -36,389 +36,6 @@ class QueueLogHandler(logging.Handler):
         self.events.put(("log", dict(text=self.format(record), key=getattr(record, "tunnel_key", None))))
 
 
-class NewHostWindow:
-    AUTH_MODES = {"自动（使用 SSH 配置）": "auto", "密码登录": "password", "密钥登录": "key"}
-    FORWARD_TYPES = {"远程转发 (RemoteForward)": "remoteforward",
-                     "本地转发 (LocalForward)": "localforward",
-                     "动态代理 (DynamicForward)": "dynamicforward"}
-
-    def __init__(self, app, path):
-        self.app, self.path = app, path
-        self.saving = False
-        self.forwards = []
-        self.window = tk.Toplevel(app.root)
-        self.window.title("新增 SSH 连接")
-        self.window.geometry("780x850")
-        self.window.minsize(700, 810)
-        self.window.transient(app.root)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        self.window.bind("<Escape>", lambda _: self.close())
-        self.window.grab_set()
-        self.alias_var = tk.StringVar()
-        self.hostname_var = tk.StringVar()
-        self.user_var = tk.StringVar()
-        self.port_var = tk.StringVar(value="22")
-        self.identity_var = tk.StringVar()
-        self.auth_var = tk.StringVar(value=next(iter(self.AUTH_MODES)))
-        self.kind_var = tk.StringVar(value=next(iter(self.FORWARD_TYPES)))
-        self.listen_address_var = tk.StringVar(value="127.0.0.1")
-        self.listen_port_var = tk.StringVar()
-        self.target_host_var = tk.StringVar(value="127.0.0.1")
-        self.target_port_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="保存后自动刷新并选中新 Host。")
-        self.form_inputs = []
-        self.rule_buttons = []
-
-        outer = ttk.Frame(self.window, padding=20)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="新增 SSH 连接", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text=f"写入配置：{path}", style="Muted.TLabel", wraplength=720).pack(anchor="w", pady=(5, 14))
-        fields = ttk.Frame(outer)
-        fields.pack(fill="x")
-        fields.columnconfigure(1, weight=1)
-        for row, (label, variable) in enumerate((("Host 别名 *", self.alias_var), ("服务器地址 *", self.hostname_var),
-                                                 ("用户名", self.user_var), ("SSH 端口 *", self.port_var),
-                                                 ("私钥文件", self.identity_var))):
-            ttk.Label(fields, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
-            widget = ttk.Entry(fields, textvariable=variable)
-            widget.grid(row=row, column=1, sticky="ew", pady=5)
-            self.form_inputs.append(widget)
-            if row == 0:
-                self.alias_input = widget
-            if row == 4:
-                self.identity_input = widget
-        self.identity_button = ttk.Button(fields, text="选择文件", command=self.browse_identity)
-        self.identity_button.grid(row=4, column=2, padx=(8, 0))
-        self.rule_buttons.append(self.identity_button)
-        ttk.Label(fields, text="登录方式").grid(row=5, column=0, sticky="w", pady=5)
-        self.auth_input = ttk.Combobox(fields, textvariable=self.auth_var, values=list(self.AUTH_MODES), state="readonly")
-        self.auth_input.grid(row=5, column=1, sticky="ew", pady=5)
-        self.auth_input.bind("<<ComboboxSelected>>", lambda _: self.update_auth_type())
-        ttk.Label(outer, text="连接时输入密码，可勾选“记住密码”。密码保存在 Windows 凭据管理器，不写入 SSH 配置。",
-                  style="Muted.TLabel", wraplength=720).pack(anchor="w", pady=(5, 12))
-
-        forwarding = ttk.LabelFrame(outer, text="端口转发（可选，可添加多条）", padding=10)
-        forwarding.pack(fill="both", expand=True)
-        type_row = ttk.Frame(forwarding)
-        type_row.pack(fill="x")
-        ttk.Label(type_row, text="类型").pack(side="left", padx=(0, 10))
-        self.kind_input = ttk.Combobox(type_row, textvariable=self.kind_var, values=list(self.FORWARD_TYPES), state="readonly", width=30)
-        self.kind_input.pack(side="left")
-        self.kind_input.bind("<<ComboboxSelected>>", lambda _: self.update_forward_type())
-        self.direction_var = tk.StringVar()
-        ttk.Label(forwarding, textvariable=self.direction_var, style="Muted.TLabel", wraplength=660).pack(anchor="w", pady=(8, 4))
-        rule = ttk.Frame(forwarding)
-        rule.pack(fill="x")
-        rule.columnconfigure(1, weight=1)
-        rule.columnconfigure(3, weight=1)
-        self.target_inputs = []
-        for row, (host_label, host_var, port_var) in enumerate((("监听地址", self.listen_address_var, self.listen_port_var),
-                                                               ("目标地址", self.target_host_var, self.target_port_var))):
-            ttk.Label(rule, text=host_label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 8))
-            host_input = ttk.Entry(rule, textvariable=host_var)
-            host_input.grid(row=row, column=1, sticky="ew", pady=5)
-            ttk.Label(rule, text="端口").grid(row=row, column=2, padx=8)
-            port_input = ttk.Entry(rule, textvariable=port_var, width=9)
-            port_input.grid(row=row, column=3, sticky="ew", pady=5)
-            self.form_inputs.extend((host_input, port_input))
-            if row == 1:
-                self.target_inputs = [host_input, port_input]
-        buttons = ttk.Frame(forwarding)
-        buttons.pack(fill="x", pady=(3, 8))
-        add_button = ttk.Button(buttons, text="添加转发规则", command=self.add_forward)
-        add_button.pack(side="left")
-        remove_button = ttk.Button(buttons, text="移除选中规则", command=self.remove_forward)
-        remove_button.pack(side="left", padx=8)
-        self.rule_buttons.extend((add_button, remove_button))
-        table = ttk.Frame(forwarding)
-        table.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(table, columns=("type", "rule"), show="headings", height=3, selectmode="browse")
-        self.tree.heading("type", text="转发类型")
-        self.tree.heading("rule", text="监听 → 目标")
-        self.tree.column("type", width=135, stretch=False)
-        self.tree.column("rule", width=470)
-        scroll = ttk.Scrollbar(table, command=self.tree.yview)
-        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
-        table.rowconfigure(0, weight=1)
-        table.columnconfigure(0, weight=1)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        footer = ttk.Frame(outer)
-        footer.pack(side="bottom", fill="x", pady=(12, 0), before=forwarding)
-        ttk.Label(footer, text="保存前校验配置并备份原文件。没有转发规则的 Host 也可保存。",
-                  style="Muted.TLabel", wraplength=720).pack(anchor="w")
-        ttk.Label(footer, textvariable=self.status_var, wraplength=720).pack(anchor="w", pady=(5, 8))
-        self.save_button = ttk.Button(footer, text="保存并刷新", style="Primary.TButton", command=self.save)
-        self.save_button.pack(side="right")
-        self.cancel_button = ttk.Button(footer, text="取消", command=self.close)
-        self.cancel_button.pack(side="right", padx=8)
-        self.update_forward_type()
-        self.alias_input.focus_set()
-
-    def browse_identity(self):
-        filename = filedialog.askopenfilename(title="选择 SSH 私钥文件", parent=self.window,
-                                             initialdir=str(Path.home() / ".ssh"))
-        if filename:
-            self.identity_var.set(filename)
-
-    def set_saving(self, saving):
-        self.saving = self.app.saving_host = saving
-        for widget in self.form_inputs + self.rule_buttons + [self.save_button, self.cancel_button]:
-            widget.configure(state="disabled" if saving else "normal")
-        self.kind_input.configure(state="disabled" if saving else "readonly")
-        self.auth_input.configure(state="disabled" if saving else "readonly")
-        if not saving:
-            self.update_forward_type()
-            self.update_auth_type()
-        self.app.update_buttons()
-
-    def update_auth_type(self):
-        state = "disabled" if self.AUTH_MODES[self.auth_var.get()] == "password" else "normal"
-        self.identity_input.configure(state=state)
-        self.identity_button.configure(state=state)
-
-    def update_forward_type(self):
-        kind = self.FORWARD_TYPES[self.kind_var.get()]
-        for widget in self.target_inputs:
-            widget.configure(state="disabled" if kind == "dynamicforward" else "normal")
-        self.direction_var.set({"remoteforward": "在服务器监听，转发到本机可访问的目标。",
-                                "localforward": "在本机监听，转发到服务器可访问的目标。",
-                                "dynamicforward": "在本机提供 SOCKS 代理，无需填写目标地址和端口。"}[kind])
-
-    def draft_forward(self):
-        return format_forward(self.FORWARD_TYPES[self.kind_var.get()], self.listen_address_var.get(),
-                              self.listen_port_var.get(), self.target_host_var.get(), self.target_port_var.get())
-
-    def add_forward(self):
-        if self.saving:
-            return
-        try:
-            forward = self.draft_forward()
-        except ValueError as exc:
-            messagebox.showerror("转发规则无效", str(exc), parent=self.window)
-            return
-        if forward not in self.forwards:
-            self.forwards.append(forward)
-            self.render_forwards()
-        self.listen_address_var.set("127.0.0.1")
-        self.listen_port_var.set("")
-        self.target_host_var.set("127.0.0.1")
-        self.target_port_var.set("")
-
-    def render_forwards(self):
-        self.tree.delete(*self.tree.get_children())
-        names = {"remoteforward": "RemoteForward", "localforward": "LocalForward", "dynamicforward": "DynamicForward"}
-        for index, (kind, value) in enumerate(self.forwards):
-            self.tree.insert("", "end", iid=str(index), values=(names[kind], value.replace(" ", " → ")))
-
-    def remove_forward(self):
-        if not self.saving and self.tree.selection():
-            self.forwards.pop(int(self.tree.selection()[0]))
-            self.render_forwards()
-
-    def save(self):
-        if self.saving or self.app.closing:
-            return
-        values = dict(alias=self.alias_var.get(), hostname=self.hostname_var.get(), user=self.user_var.get(),
-                      port=self.port_var.get(), identity_file=self.identity_var.get(), forwards=list(self.forwards),
-                      auth_mode=self.AUTH_MODES[self.auth_var.get()])
-        try:
-            # 已填写的规则即使尚未点击“添加”，也随本次保存写入，避免静默丢失。
-            if (self.listen_port_var.get().strip() or self.target_port_var.get().strip()
-                    or self.listen_address_var.get().strip() not in ("", "127.0.0.1")
-                    or self.target_host_var.get().strip() not in ("", "127.0.0.1")):
-                draft = self.draft_forward()
-                if draft not in values["forwards"]:
-                    values["forwards"].append(draft)
-            build_host_block(**values)
-        except ValueError as exc:
-            messagebox.showerror("连接配置无效", str(exc), parent=self.window)
-            return
-        self.set_saving(True)
-        self.status_var.set("正在校验并保存 SSH 配置…")
-
-        def worker():
-            try:
-                backup = save_new_host(self.path, ssh_path=self.app.ssh_path, cfg=copy.copy(self.app.cfg),
-                                       extra_args=self.app.extra_args, **values)
-                self.app.events.put(("host_saved", (self, values["alias"].strip(), backup, None)))
-            except Exception as exc:
-                self.app.events.put(("host_saved", (self, values["alias"].strip(), None, str(exc))))
-        threading.Thread(target=worker, daemon=True).start()
-
-    def close(self):
-        if self.saving:
-            return
-        self.window.grab_release()
-        self.window.destroy()
-        self.app.new_host_window = None
-        self.app.update_buttons()
-        if self.app._startup_hosts and not self.app.closing:
-            self.app.root.after_idle(self.app._start_next_host)
-
-
-class AuthWindow:
-    """非阻塞提示，主窗口仍可断开连接或退出。"""
-    def __init__(self, app, request):
-        self.app, self.request = app, request
-        self.window = tk.Toplevel(app.root)
-        confirm = request.kind == "confirm"
-        self.window.title("确认服务器指纹" if confirm else "SSH 登录验证")
-        self.window.transient(app.root)
-        self.window.resizable(True, False)
-        self.window.protocol("WM_DELETE_WINDOW", lambda: self.finish(None))
-        self.window.bind("<Escape>", lambda _: self.finish(None))
-        outer = ttk.Frame(self.window, padding=22)
-        outer.pack(fill="both", expand=True)
-        entry = request.session.tunnel.entry
-        ttk.Label(outer, text=f"{entry.alias} · {entry.user}@{entry.hostname}:{entry.port}",
-                  style="Host.TLabel", wraplength=600).pack(anchor="w")
-        ttk.Label(outer, text="请核对服务器指纹后确认。" if confirm else
-                  ("上次密码未通过验证，请重新输入。" if request.retry else "请输入 SSH 请求的密码、私钥口令或验证码。"),
-                  wraplength=600).pack(anchor="w", pady=(12, 8))
-        prompt = tk.Text(outer, width=72, height=min(10, max(3, len(request.prompt) // 72 + request.prompt.count("\n") + 1)),
-                         wrap="word", font=("Consolas", 10))
-        prompt.insert("1.0", request.prompt)
-        prompt.configure(state="disabled")
-        prompt.pack(fill="x")
-        self.secret = tk.StringVar()
-        self.remember = tk.BooleanVar(value=False)
-        if not confirm:
-            self.input = ttk.Entry(outer, textvariable=self.secret, show="●")
-            self.input.pack(fill="x", pady=(12, 8))
-            self.input.focus_set()
-            self.input.bind("<Return>", lambda _: self.submit())
-            if request.kind == "password" and app.auth.store.available:
-                ttk.Checkbutton(outer, text="记住密码，下次打开软件自动使用", variable=self.remember).pack(anchor="w")
-                ttk.Label(outer, text="未勾选时仅在本次运行中记住，可用主窗口的“忘记密码”清除。",
-                          style="Muted.TLabel", wraplength=600).pack(anchor="w", pady=(4, 0))
-            else:
-                ttk.Label(outer, text="私钥口令、验证码及经跳板机连接的验证信息仅用于本次验证。",
-                          style="Muted.TLabel", wraplength=600).pack(anchor="w")
-        controls = ttk.Frame(outer)
-        controls.pack(fill="x", pady=(18, 0))
-        ttk.Button(controls, text="确认并继续" if confirm else "继续连接", command=self.submit).pack(side="right")
-        ttk.Button(controls, text="取消连接", command=lambda: self.finish(None)).pack(side="right", padx=8)
-        app.restore()
-        self.window.lift()
-        if not confirm:
-            self.input.focus_force()
-
-    def submit(self):
-        answer = "yes" if self.request.kind == "confirm" else self.secret.get()
-        if any(char in answer for char in "\r\n\0") or len(answer.encode("utf-8")) > 1000:
-            messagebox.showerror("输入无效", "输入不能包含换行或空字符，且不能超过 1000 字节。", parent=self.window)
-            return
-        self.finish(answer)
-
-    def finish(self, answer):
-        self.request.reply(answer, self.remember.get())
-        self.secret.set("")
-        self.window.destroy()
-        self.app.auth_window = None
-
-
-class GlobalTunnelWindow:
-    """只显示当前管理器创建过的连接，不因关闭这个窗口而断开隧道。"""
-    def __init__(self, app):
-        self.app = app
-        self.window = tk.Toplevel(app.root)
-        self.window.title("全部隧道连接状态")
-        self.window.geometry("1120x650")
-        self.window.minsize(880, 500)
-        self.window.configure(background="#f1f5f9")
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        self.summary_var = tk.StringVar()
-        outer = ttk.Frame(self.window, padding=20)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="全部隧道", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, textvariable=self.summary_var, style="Muted.TLabel").pack(anchor="w", pady=(5, 15))
-        table = ttk.Frame(outer)
-        table.pack(fill="both", expand=True)
-        columns = ("host", "state", "destination", "response", "uptime", "retries", "pid")
-        self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
-        for column, label, width in zip(columns, ("Host", "状态", "服务器", "上次响应", "连接时长", "重连", "PID"),
-                                         (175, 135, 230, 150, 95, 60, 70)):
-            self.tree.heading(column, text=label)
-            self.tree.column(column, width=width, minwidth=50, stretch=column in ("host", "destination"))
-        vertical = ttk.Scrollbar(table, command=self.tree.yview)
-        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        table.rowconfigure(0, weight=1)
-        table.columnconfigure(0, weight=1)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        for phase, (_, color) in PHASES.items():
-            self.tree.tag_configure(phase, foreground=color)
-        self.tree.bind("<<TreeviewSelect>>", lambda _: self.show_details())
-        detail = ttk.LabelFrame(outer, text="选中隧道", padding=10)
-        detail.pack(side="bottom", fill="x", pady=12, before=table)
-        self.details = tk.Text(detail, height=4, wrap="word", font=("Microsoft YaHei UI", 9),
-                               relief="flat", background="white", foreground="#334155")
-        self.details.pack(fill="x")
-        controls = ttk.Frame(outer)
-        controls.pack(side="bottom", fill="x", before=detail)
-        self.disconnect_button = ttk.Button(controls, text="断开选中隧道", command=self.disconnect_selected)
-        self.disconnect_button.pack(side="left")
-        self.disconnect_all_button = ttk.Button(controls, text="全部断开", command=app.disconnect_all)
-        self.disconnect_all_button.pack(side="left", padx=8)
-        ttk.Label(controls, text="状态自动刷新；关闭此窗口不影响连接。", style="Muted.TLabel").pack(side="right")
-        self.states = {}
-        self.refresh()
-
-    def selected_state(self):
-        selection = self.tree.selection()
-        return self.states.get(selection[0]) if selection else None
-
-    def refresh(self):
-        states = self.app.controller.snapshots()
-        counts = self.app.controller.global_snapshot()["counts"]
-        self.summary_var.set(f"已连接 {counts['connected']}  ·  连接中 {counts['connecting']}  ·  "
-                             f"等待响应 / 重连 {counts['unresponsive'] + counts['reconnecting']}  ·  "
-                             f"失败 {counts['error']}  ·  已断开 {counts['disconnected']}")
-        self.states = {state["key"]: state for state in states}
-        for item in self.tree.get_children():
-            if item not in self.states:
-                self.tree.delete(item)
-        now = time.time()
-        for key, state in self.states.items():
-            received = state["last_received"]
-            response = time.strftime("%H:%M:%S", time.localtime(received)) + f"（{max(0, int(now - received))} 秒前）" if received else "—"
-            uptime = f"{max(0, int(now - state['connected_at']))} 秒" if state["connected_at"] and state["phase"] in ("connected", "unresponsive") else "—"
-            values = (state["host"], PHASES[state["phase"]][0], state["destination"], response, uptime, state["retries"], state["pid"] or "—")
-            if self.tree.exists(key):
-                self.tree.item(key, values=values, tags=(state["phase"],))
-            else:
-                self.tree.insert("", "end", iid=key, values=values, tags=(state["phase"],))
-        if not self.tree.selection() and self.tree.get_children():
-            self.tree.selection_set(self.tree.get_children()[0])
-        self.show_details()
-        self.disconnect_all_button.configure(state="normal" if self.app.controller.is_running() and not self.app.busy and not self.app.closing else "disabled")
-
-    def show_details(self):
-        state = self.selected_state()
-        if state:
-            rules = "; ".join(f"{key} {value}" for key, value in state["forwards"])
-            text = f"SSH 配置：{state['ssh_config']}\n{state['message']}\n转发：{rules}\n"
-            text += f"保活：{state['heartbeat_interval']} 秒 / {state['heartbeat_count']} 次；自动重连：{'开启' if state['auto_reconnect'] else '关闭'}"
-        else:
-            text = "尚未建立隧道。在主窗口选择 Host 后点击建立隧道。"
-        TunnelApp._set_text(self.details, text)
-        self.disconnect_button.configure(state="normal" if state and state["phase"] not in ("disconnected", "error") and not self.app.busy and not self.app.closing else "disabled")
-
-    def disconnect_selected(self):
-        state = self.selected_state()
-        if state:
-            self.app.disconnect_host(state["host"], state["ssh_config"])
-
-    def close(self):
-        self.app.global_window = None
-        self.window.destroy()
-
-
 class TunnelApp:
     def __init__(self, root, cfg, ssh_path, ssh_config, config_path, log_file, lock,
                  extra_args=None, config_override=False, startup_hosts=None):
@@ -427,6 +44,9 @@ class TunnelApp:
         self.extra_args = extra_args
         self.preference_path = Path(config_path).with_name(Path(config_path).stem + ".gui.json")
         self.preferences = self._read_preferences()
+        self.settings_store = SettingsStore(Path(config_path).with_suffix(".settings.json"))
+        self.global_settings = self.settings_store.load()
+        self.settings_window = None
         self._startup_hosts = list(dict.fromkeys(startup_hosts or []))
         if self._startup_hosts:
             self.preferences["last_host"] = self._startup_hosts[0]
@@ -440,12 +60,14 @@ class TunnelApp:
         self.logs = deque(maxlen=1000)
         self.global_window = None
         self.new_host_window = None
+        self.source_window = None
         self.saving_host = False
         self._selected_key = None
         self._busy_key = None
         self.entries = {}
         self.generation = 0
         self.loading = self.busy = self.closing = False
+        self.load_error = None
         self._minimize_requested = False
         self.tray = None
         self._tray_windows = []
@@ -454,6 +76,7 @@ class TunnelApp:
         self._last_state = None
         self.path_var = tk.StringVar(value=str(ssh_config if config_override else self.preferences.get("ssh_config", ssh_config)))
         self.search_var = tk.StringVar()
+        self.only_forward_var = tk.BooleanVar(value=True)
         self.interval_var = tk.StringVar(value=str(self.preferences.get("heartbeat_interval", cfg.heartbeat_interval)))
         self.count_var = tk.StringVar(value=str(self.preferences.get("heartbeat_count", cfg.heartbeat_count)))
         self.reconnect_var = tk.BooleanVar(value=self.preferences.get("auto_reconnect", cfg.auto_reconnect))
@@ -469,11 +92,12 @@ class TunnelApp:
         self._build_ui()
         self._handler = QueueLogHandler(self.events)
         logging.getLogger().addHandler(self._handler)
-        self.root.protocol("WM_DELETE_WINDOW", self.minimize)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self.root.bind("<Destroy>", self._on_destroy, add="+")
         self._start_tray()
         self.root.bind("<Control-r>", lambda _: self.reload_hosts())
         self.search_var.trace_add("write", lambda *_: self.filter_hosts())
+        self.only_forward_var.trace_add("write", lambda *_: self.filter_hosts())
         for variable in (self.interval_var, self.count_var):
             variable.trace_add("write", lambda *_: self._update_health_text())
         self._update_health_text()
@@ -491,7 +115,7 @@ class TunnelApp:
         self.root.title("SSH 隧道管理器")
         if os.name == "nt":
             # __file__ also points into PyInstaller's bundled resource directory.
-            self.root.iconbitmap(default=str(Path(__file__).resolve().parent / "assets" / "ssh-tunnels.ico"))
+            self.root.iconbitmap(default=str(resource_path("assets/ssh-tunnels.ico")))
         self.root.geometry("1060x840")
         self.root.minsize(880, 760)
         self.root.configure(background="#f1f5f9")
@@ -512,6 +136,7 @@ class TunnelApp:
         style.configure("TLabelframe", background="#f1f5f9")
         style.configure("TLabelframe.Label", background="#f1f5f9", font=("Microsoft YaHei UI", 10))
         style.configure("TCheckbutton", background="#f1f5f9", font=("Microsoft YaHei UI", 10))
+        self._configure_reconnect_style(style)
 
         outer = ttk.Frame(self.root, padding=22)
         outer.pack(fill="both", expand=True)
@@ -520,6 +145,8 @@ class TunnelApp:
         ttk.Label(heading, text="SSH 隧道管理器", style="Title.TLabel").pack(side="left")
         self.global_button = ttk.Button(heading, text="全部隧道（0）", command=self.open_global_window)
         self.global_button.pack(side="right")
+        self.settings_button = ttk.Button(heading, text="配置中心", command=self.open_settings)
+        self.settings_button.pack(side="right", padx=8)
         ttk.Label(outer, text="多个 Host 同时连接 · 独立保活与自动重连", style="Muted.TLabel").pack(anchor="w", pady=(3, 16))
         config = ttk.Frame(outer)
         config.pack(fill="x", pady=(0, 14))
@@ -533,6 +160,8 @@ class TunnelApp:
         self.reload_button.pack(side="left")
         self.add_button = ttk.Button(config, text="新增连接", command=self.open_new_host)
         self.add_button.pack(side="left", padx=(8, 0))
+        self.source_button = ttk.Button(config, text="查看配置", command=self.open_config_source)
+        self.source_button.pack(side="left", padx=(8, 0))
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
@@ -543,6 +172,9 @@ class TunnelApp:
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
         ttk.Entry(left, textvariable=self.search_var).pack(fill="x", pady=(0, 8))
         ttk.Label(left, text="搜索 Host 名称", style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        self.only_forward_input = ttk.Checkbutton(left, text="只显示带转发规则的 Host",
+                                                 variable=self.only_forward_var, style="Reconnect.TCheckbutton")
+        self.only_forward_input.pack(anchor="w", pady=(0, 8))
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(tree_frame, columns=("host", "forward"), show="headings", selectmode="browse")
@@ -556,6 +188,15 @@ class TunnelApp:
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda _: self.show_selected())
         self.tree.bind("<Double-1>", lambda _: self.connect())
+        self.tree.bind("<Button-3>", self.show_host_menu)
+        self.tree.bind("<Shift-F10>", self.show_host_menu)
+        self.host_menu = tk.Menu(self.root, tearoff=False)
+        self.host_menu.add_command(label="连接 / 重新连接", command=lambda: self.connect(reconnect=True))
+        self.host_menu.add_command(label="断开连接", command=self.disconnect)
+        self.host_menu.add_separator()
+        self.host_menu.add_command(label="编辑 Host…", command=self.edit_selected_host)
+        self.host_menu.add_command(label="删除 Host…", command=self.delete_selected_host)
+        self.host_menu.add_command(label="查看源配置", command=lambda: self.open_config_source(self.selected_alias()))
         ttk.Label(left, textvariable=self.list_var, style="Muted.TLabel", wraplength=260).pack(anchor="w", pady=8)
 
         right = ttk.Frame(body)
@@ -588,7 +229,7 @@ class TunnelApp:
         self.connect_button.pack(side="left", padx=(0, 8))
         self.disconnect_button = ttk.Button(controls, text="断开此 Host", command=self.disconnect)
         self.disconnect_button.pack(side="left")
-        self.forget_button = ttk.Button(controls, text="忘记密码", command=self.forget_password)
+        self.forget_button = ttk.Button(controls, text="清除历史密码", command=self.forget_password)
         self.forget_button.pack(side="left", padx=(8, 0))
         settings = ttk.Frame(right)
         settings.pack(fill="x")
@@ -598,7 +239,8 @@ class TunnelApp:
         ttk.Label(settings, text="秒   未响应次数").pack(side="left")
         self.count_input = ttk.Spinbox(settings, from_=1, to=10, width=3, textvariable=self.count_var)
         self.count_input.pack(side="left", padx=5)
-        self.reconnect_input = ttk.Checkbutton(settings, text="断线自动重连", variable=self.reconnect_var)
+        self.reconnect_input = ttk.Checkbutton(settings, text="断线自动重连", variable=self.reconnect_var,
+                                               style="Reconnect.TCheckbutton")
         self.reconnect_input.pack(side="right")
         ttk.Label(right, textvariable=self.health_var, style="Muted.TLabel", wraplength=570).pack(anchor="w", pady=(6, 10))
 
@@ -613,7 +255,9 @@ class TunnelApp:
         footer = ttk.Frame(outer)
         # 先为页脚留出空间，避免缩小窗口时被主体挤出视口。
         footer.pack(side="bottom", fill="x", pady=(13, 0), before=body)
-        ttk.Label(footer, text="关闭后驻留托盘，双击托盘图标恢复窗口。", style="Muted.TLabel").pack(side="left")
+        self.close_hint_label = ttk.Label(footer, style="Muted.TLabel")
+        self.close_hint_label.pack(side="left")
+        self.update_close_hint()
         self.exit_button = ttk.Button(footer, text="退出应用", command=self.close)
         self.exit_button.pack(side="right", padx=(8, 0))
         ttk.Button(footer, text="打开日志", command=self.open_log).pack(side="right")
@@ -631,6 +275,120 @@ class TunnelApp:
             self.health_var.set(f"空闲时发送 SSH 保活，约 {seconds} 秒无响应判定断线；状态每秒刷新。设置在此 Host 下次连接时生效。")
         except ValueError:
             self.health_var.set("请输入正整数；设置在下次连接时生效。")
+
+    def _configure_reconnect_style(self, style):
+        # 独立绘制空框与对勾，避免 clam 的实心标记和系统字体差异。
+        size = max(16, round(self.root.winfo_fpixels("1i") / 96 * 18))
+        self._reconnect_images = []
+        for checked, disabled in ((False, False), (True, False), (False, True), (True, True)):
+            icon = tk.PhotoImage(master=self.root, width=size + 6, height=size)
+            border = "#94a3b8" if disabled else "#475569"
+            icon.put(border, to=(0, 0, size, size))
+            icon.put("#e2e8f0" if disabled else "#ffffff", to=(1, 1, size - 1, size - 1))
+            if checked:
+                color = "#64748b" if disabled else "#166534"
+                points = [(round(size * x), round(size * y)) for x, y in ((.2, .5), (.42, .72), (.8, .25))]
+                for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                    steps = max(abs(x2 - x1), abs(y2 - y1))
+                    for i in range(steps + 1):
+                        x, y = round(x1 + (x2 - x1) * i / steps), round(y1 + (y2 - y1) * i / steps)
+                        icon.put(color, to=(x, y, min(size - 1, x + 2), min(size - 1, y + 2)))
+            self._reconnect_images.append(icon)
+        blank, checked, disabled, checked_disabled = self._reconnect_images
+        # 一个 Tk 解释器内只注册一次；图片引用由当前 app 持有。
+        if "Reconnect.indicator" not in style.element_names():
+            style.element_create("Reconnect.indicator", "image", blank,
+                                 ("disabled", "selected", checked_disabled), ("disabled", disabled),
+                                 ("selected", checked), sticky="w")
+        style.layout("Reconnect.TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Reconnect.indicator", {"side": "left", "sticky": "w"}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Checkbutton.label", {"sticky": "nswe"})]})]})])
+        style.configure("Reconnect.TCheckbutton", padding=(0, 0, 0, 0))
+
+    def show_host_menu(self, event):
+        if self.loading or self.busy or self.closing or self.new_host_window or self.saving_host:
+            return "break"
+        if event.keysym == "F10":
+            selection = self.tree.selection()
+            row = selection[0] if selection else ""
+            bounds = self.tree.bbox(row) if row else ()
+            if not bounds:
+                return "break"
+            x, y = self.tree.winfo_rootx() + bounds[0] + 20, self.tree.winfo_rooty() + bounds[1] + bounds[3]
+        else:
+            row = self.tree.identify_row(event.y)
+            x, y = event.x_root, event.y_root
+        if not row:
+            return "break"
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        self.show_selected()
+        self.host_menu.entryconfigure(0, state=self.connect_button.cget("state"))
+        self.host_menu.entryconfigure(1, state=self.disconnect_button.cget("state"))
+        try:
+            self.host_menu.tk_popup(x, y)
+        finally:
+            self.host_menu.grab_release()
+        return "break"
+
+    def _config_action_path(self):
+        path = Path(self.path_var.get()).expanduser().resolve()
+        if path != self.loaded_path:
+            raise ValueError("SSH 配置路径已变化，请先点击刷新 Host。")
+        return path
+
+    def open_config_source(self, alias=None):
+        if self.closing or self.new_host_window or self.saving_host:
+            return
+        try:
+            path = self._config_action_path()
+            if self.source_window:
+                self.source_window.close()
+            self.source_window = ConfigSourceWindow(self, path, alias)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法查看源配置", str(exc), parent=self.root)
+
+    def edit_selected_host(self):
+        if self.loading or self.busy or self.closing or self.new_host_window or self.saving_host or not self.selected_alias():
+            return
+        try:
+            config = load_host_config(self._config_action_path(), self.selected_alias())
+            self.new_host_window = HostEditorWindow(self, config)
+            self.update_buttons()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法编辑 Host", str(exc), parent=self.root)
+
+    def delete_selected_host(self):
+        if self.loading or self.busy or self.closing or self.new_host_window or self.saving_host or not self.selected_alias():
+            return
+        alias = self.selected_alias()
+        # 配置删除不会偷偷断开正在运行的隧道，也不会让其重连到错误地址。
+        state = self.selected_state()
+        if state["phase"] not in ("disconnected", "error") or state.get("pid"):
+            messagebox.showinfo("Host 正在运行", "请先手动断开此 Host，再删除配置。其他隧道不受影响。", parent=self.root)
+            return
+        try:
+            config = load_host_config(self._config_action_path(), alias)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法删除 Host", str(exc), parent=self.root)
+            return
+        sources = "\n".join(block.label for block in config.blocks)
+        if not messagebox.askyesno("删除 Host 配置", f"删除 {alias} 的显式配置？\n\n{sources}\n\n"
+                                  "保存前备份原文件，其他 Host 的配置保持原样。", parent=self.root):
+            return
+        self.saving_host = True
+        self.update_buttons()
+        backup_limit = self.global_settings.backup_limit
+
+        def worker():
+            try:
+                backup = delete_host(config, self.ssh_path, copy.copy(self.cfg), self.extra_args,
+                                     backup_limit=backup_limit)
+                self.events.put(("host_deleted", (alias, backup, None)))
+            except Exception as exc:
+                self.events.put(("host_deleted", (alias, None, str(exc))))
+        threading.Thread(target=worker, daemon=True).start()
 
     def browse(self):
         filename = filedialog.askopenfilename(title="选择 SSH config", initialdir=str(Path(self.path_var.get()).expanduser().parent),
@@ -660,6 +418,7 @@ class TunnelApp:
         path = Path(self.path_var.get()).expanduser().resolve()
         self.loaded_path = path
         self.loading = True
+        self.load_error = None
         self._selected_key = None
         self.entries = {}
         self.filter_hosts()
@@ -712,7 +471,8 @@ class TunnelApp:
         self.tree.delete(*self.tree.get_children())
         query = self.search_var.get().strip().lower()
         for i, (alias, entry) in enumerate(self.entries.items()):
-            if query in alias.lower():
+            if query in alias.lower() and (not self.only_forward_var.get() or
+                                          (entry.has_forward and not hasattr(entry, "error"))):
                 item = self.tree.insert("", "end", iid=f"host-{i}", values=(alias, "读取失败" if hasattr(entry, "error") else
                                         f"{len(entry.forwards)} 条" if entry.has_forward else "无"))
                 if alias == selected:
@@ -720,6 +480,25 @@ class TunnelApp:
                     self.tree.see(item)
         if not self.tree.selection() and self.tree.get_children():
             self.tree.selection_set(self.tree.get_children()[0])
+        if not self.loading:
+            visible = len(self.tree.get_children())
+            if self.load_error:
+                self.list_var.set(self.load_error)
+            elif not self.entries:
+                self.list_var.set("没有显式 Host 别名，请在配置中添加 Host。")
+            else:
+                errors = sum(hasattr(entry, "error") for entry in self.entries.values())
+                message = f"显示 {visible} / {len(self.entries)} 个 Host"
+                if errors:
+                    message += f" · {errors} 个读取失败"
+                warnings = sum(bool(entry.login_forwarding_warning) for entry in self.entries.values())
+                if warnings:
+                    message += f" · {warnings} 个普通登录配置需检查"
+                if self.only_forward_var.get() and (not visible or errors or warnings):
+                    message += "；取消勾选可显示全部 Host"
+                elif not visible:
+                    message += "；请调整搜索条件"
+                self.list_var.set(message)
         self.show_selected()
 
     def show_selected(self):
@@ -738,6 +517,10 @@ class TunnelApp:
         self.destination_var.set(f"{entry.user}@{entry.hostname}:{entry.port}" if entry and entry.hostname else "从左侧列表选择 SSH 配置")
         if entry:
             text = getattr(entry, "error", None) or "\n".join(f"{key}  {value}" for key, value in entry.forwards) or "这个 Host 没有转发规则，可在 SSH config 中添加或选择另一个 Host。"
+            if entry.login_forwarding_warning:
+                text = entry.login_forwarding_warning + "\n\n" + text
+            elif alias.endswith("-noforward") and not hasattr(entry, "error"):
+                text = "普通登录配置没有预设转发规则，可用于终端或 VS Code，并允许客户端请求自己的转发。"
         else:
             text = "选择 Host 后显示配置"
         self._set_text(self.forward_text, text)
@@ -814,7 +597,7 @@ class TunnelApp:
             return
         try:
             self.auth.forget(entry, self.loaded_path)
-            messagebox.showinfo("已忘记密码", f"已清除 {entry.alias} 的已保存密码和本次运行的密码缓存，下次验证时会重新询问。", parent=self.root)
+            messagebox.showinfo("已清除历史密码", f"已清除 {entry.alias} 的已保存密码和本次运行的密码缓存，下次验证时会重新询问。", parent=self.root)
         except OSError:
             messagebox.showerror("清除失败", "无法访问 Windows 凭据管理器，请稍后重试。", parent=self.root)
 
@@ -827,7 +610,7 @@ class TunnelApp:
             self._operation(self.controller.disconnect)
 
     def _start_next_host(self):
-        if self.closing or self.busy or self.loading or self.new_host_window:
+        if self.closing or self.busy or self.loading or self.new_host_window or self.saving_host:
             return
         while self._startup_hosts:
             alias = self._startup_hosts.pop(0)
@@ -851,8 +634,9 @@ class TunnelApp:
                                       text="重新连接此 Host" if state["phase"] not in ("disconnected", "error") else "建立隧道")
         self.disconnect_button.configure(state="normal" if not self.busy and not self.closing and state["phase"] not in ("disconnected", "error") else "disabled")
         self.exit_button.configure(state="disabled" if self.closing else "normal")
-        for widget in (self.path_entry, self.browse_button, self.reload_button, self.add_button, self.interval_input, self.count_input, self.reconnect_input):
-            widget.configure(state="disabled" if self.busy or self.closing or self.new_host_window else "normal")
+        for widget in (self.path_entry, self.browse_button, self.reload_button, self.add_button, self.source_button, self.settings_button,
+                       self.interval_input, self.count_input, self.reconnect_input):
+            widget.configure(state="disabled" if self.busy or self.closing or self.new_host_window or self.saving_host else "normal")
 
     def render_status(self):
         state = self.selected_state()
@@ -861,6 +645,8 @@ class TunnelApp:
         self.active_var.set(f"选中 Host：{state['host'] or '无'}" + (f"   PID {state['pid']}" if state["pid"] else ""))
         if not self.busy or self._busy_key not in (None, self._selected_key):
             message = state["message"]
+            if state.get("config_pending") and state.get("pid"):
+                message += "；配置已保存，当前连接继续使用原参数，下次连接生效"
             if state["retry_at"] and state["phase"] == "reconnecting":
                 message += f"；{max(0, int(state['retry_at'] - time.time()))} 秒后重试"
             self.message_var.set(message)
@@ -908,14 +694,17 @@ class TunnelApp:
                 _, self.entries, errors, _ = payload
                 self.loading = False
                 self.filter_hosts()
-                self.list_var.set(f"{len(self.entries)} 个 Host · 双击可连接" if self.entries else "没有显式 Host 别名，请在配置中添加 Host。")
                 for error in errors:
                     logging.getLogger("gui").warning("配置读取失败：%s", error)
+                for entry in self.entries.values():
+                    if entry.login_forwarding_warning:
+                        logging.getLogger("gui").warning("%s：%s", entry.alias, entry.login_forwarding_warning)
                 self.save_preferences()
                 if self._startup_hosts:
                     self.root.after_idle(self._start_next_host)
             elif kind == "hosts_error" and payload[0] == self.generation:
                 self.loading = False
+                self.load_error = payload[1]
                 self.list_var.set(payload[1])
                 logging.getLogger("gui").error(payload[1])
             elif kind == "host_saved":
@@ -927,13 +716,37 @@ class TunnelApp:
                         messagebox.showerror("保存 SSH 配置失败", error, parent=dialog.window)
                 else:
                     dialog.close()
-                    logging.getLogger("gui").info("已新增 Host %s，写入 %s%s", alias, dialog.path,
+                    if isinstance(dialog, HostEditorWindow):
+                        renames = dialog.edit_plan.renames
+                        settings = self.preferences.get("host_settings", {})
+                        for old, new in renames.items():
+                            old_key, new_key = tunnel_key(old, dialog.path), tunnel_key(new, dialog.path)
+                            if old_key in settings:
+                                settings[new_key] = settings.pop(old_key)
+                            for record in self.logs:
+                                if record["key"] == old_key:
+                                    record["key"] = new_key
+                        self._startup_hosts = [renames.get(name, name) for name in self._startup_hosts]
+                    logging.getLogger("gui").info("已%s Host %s，配置入口 %s%s", getattr(dialog, "action", "新增"), alias, dialog.path,
                                                   f"；原配置备份：{backup}" if backup else "")
                     if not self.closing:
                         self.path_var.set(str(dialog.path))
                         self.save_preferences(last_host=alias, ssh_config=dialog.path)
                         self.search_var.set("")
                         self.reload_hosts()
+            elif kind == "host_deleted":
+                alias, backup, error = payload
+                self.saving_host = False
+                if error:
+                    if not self.closing:
+                        messagebox.showerror("删除 SSH 配置失败", error, parent=self.root)
+                else:
+                    logging.getLogger("gui").info("已删除 Host %s；原配置备份：%s", alias, backup)
+                    if not self.closing:
+                        self.reload_hosts()
+            elif kind == "config_backup":
+                dialog, backups, error = payload
+                dialog.backup_finished(backups, error)
             elif kind in ("operation_done", "operation_error"):
                 self.busy = False
                 closed_operation = self._operation_is_close
@@ -975,10 +788,29 @@ class TunnelApp:
     def _start_tray(self):
         if os.name == "nt" and self.tray is None:
             try:
-                self.tray = WindowsTrayIcon(Path(__file__).resolve().parent / "assets" / "ssh-tunnels.ico",
+                self.tray = WindowsTrayIcon(resource_path("assets/ssh-tunnels.ico"),
                                             lambda action: self.events.put(("tray", action)))
             except OSError:
                 logging.getLogger("gui").exception("无法初始化系统托盘")
+
+    def open_settings(self):
+        if self.closing or self.new_host_window or self.saving_host:
+            return
+        if self.settings_window:
+            self.settings_window.window.lift()
+        else:
+            self.settings_window = SettingsWindow(self)
+
+    def update_close_hint(self):
+        text = ("关闭窗口将退出应用，并断开全部隧道。" if self.global_settings.close_action == "exit"
+                else "关闭后驻留托盘，双击托盘图标恢复窗口。")
+        self.close_hint_label.configure(text=text)
+
+    def on_window_close(self):
+        if self.global_settings.close_action == "exit":
+            self.close()
+        else:
+            self.minimize()
 
     def minimize(self):
         """隐藏到托盘，不改变连接、保存或重连状态。"""

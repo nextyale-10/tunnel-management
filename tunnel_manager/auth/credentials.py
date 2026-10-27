@@ -95,3 +95,20 @@ class CredentialStore:
                 self.delete(pointers[index].contents.TargetName)
         finally:
             self.api.CredFree(pointers)
+
+    def copy_prefix(self, source, destination):
+        """改名后复制同一登录目标的凭据，旧记录留给仍在运行的认证会话。"""
+        if not self.available or source == destination:
+            return
+        count = wintypes.DWORD()
+        pointers = ctypes.POINTER(ctypes.POINTER(Credential))()
+        if not self._check(self.api.CredEnumerateW(source + "*", 0, ctypes.byref(count), ctypes.byref(pointers)), True):
+            return
+        try:
+            for index in range(count.value):
+                old = pointers[index].contents.TargetName
+                password = self.read(old)
+                if password is not None:
+                    self.write(destination + old[len(source):], password)
+        finally:
+            self.api.CredFree(pointers)
